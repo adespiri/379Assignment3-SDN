@@ -15,10 +15,14 @@
 #include <fstream>
 #include <poll.h>
 #include <signal.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <netdb.h>
 
 #define MAX_NSW 7;
 #define MAX_IP 1000;
 #define MIN_PRI 4;
+#define MY_PORT 9698;
 
 using namespace std;
 
@@ -42,6 +46,7 @@ typedef struct {
 	int port1;
 	int port2;
 	int switchNumber; 
+	int sfd;
 
 } MSG_PACKET; //used for OPEN. The switch sends its details to the controller, may have to rework this
 
@@ -86,6 +91,7 @@ typedef struct {
 	int IP_hi;
 	int keyboardFifo;
 	vector<Rule> rulesList;
+	int sfd; //each switch now has its own file descriptor
 
 	int admitCounter;
 	int ackCounter;
@@ -104,8 +110,7 @@ typedef struct {
 	int addSentCounter;
 	int keyboardFifo;
 	vector<MSG_PACKET> connectedSwitches; //used for when controller acknowledges a new switch
-	vector<int> fifoReadList; //fifo read list contains all fifos that the controller will write to
-	vector<int> fifoWriteList; //fifos to write to
+	int sfd; //socket descriptor
 } Controller; //controller struct to contain counters
 
 Switch* instanceSwitch;
@@ -164,11 +169,11 @@ void printController(Controller* cont)
 	printf("\tTransmitted:\tACK:%d, ADD:%d\n\n", cont->ackSentCounter, cont->addSentCounter);
 }
 
-void sendAckPacket(int switchNumber, int SCfifo)
+void sendAckPacket(int switchNumber, int sfd)
 {/*	This method is used by the controller to send the acknowledgment packet to the designated switch*/
 	FRAME frame;
 	frame.kind = ACK;
-	write(SCfifo, (char *)&frame, sizeof(frame));
+	write(sfd, (char *)&frame, sizeof(frame));
 }
 
 void sendAddPacket(int switchNumber, int SCfifo, MSG* msg)
@@ -179,7 +184,7 @@ void sendAddPacket(int switchNumber, int SCfifo, MSG* msg)
 	write(SCfifo, (char *)&frame, sizeof(frame));
 
 }
-
+//HAVE TO CHANGE THIS
 MSG createRule(int port1, int port2, int dstIP, int srcIP,Controller cont)
 {	/*Method that creates a rule when a switch queries*/
 	MSG msg;
@@ -247,7 +252,7 @@ void pollKeyboard(int keyBoardFifo, KIND kind)
 	}
 }
 
-void executeController(int numberofSwitches)
+void executeController(int numberofSwitches, const char* portNum)
 {	/* This is the main method that will be used for the instance that the controller is chosen*/
 	Controller cont;
 	instanceController = &cont; //global controller quals cont, FOR USER1SIGNAL handling
@@ -255,29 +260,48 @@ void executeController(int numberofSwitches)
 	cont.queryRcvCounter = 0;
 	cont.ackSentCounter = 0;
 	cont.addSentCounter = 0;
-	pid_t newpid = fork(); //forking a process which is needed for polling keyboard
 	cont.keyboardFifo = open("fifo-keyboardcont", O_RDWR); //open up keyboard Fifo
+	pid_t newpid = fork(); //forking a process which is needed for polling keyboard
 
 	if (newpid == 0) //the child process will go to the keyboard polling state
 	{
 		pollKeyboard(cont.keyboardFifo, CONT_INPUT);
 	}
+
+	
+	int newsocket;
+	struct sockaddr_storage peer_addr;
+	socklen_t addr_size;
+
+	//bind the socket to the localhost
+	struct addrinfo hints, *res; //reference from lecture notes and http://beej.us/guide/bgnet/html/multi/syscalls.html#accept
+	memset((char*)&hints, 0, sizeof(hints));
+	hints.ai_family = AF_INET;
+	hints.ai_socktype = SOCK_STREAM;
+	hints.ai_flags = AI_NUMERICSERV | AI_PASSIVE; //service is port num and fill in ip for me 
+
+	getaddrinfo(NULL, portNum, &hints, &res);
+	cont.sfd = socket(res->ai_family, res->ai_socktype, res->ai_protocol); //create the socket and bind it
+
+	if (bind(cont.sfd, res->ai_addr, res->ai_addrlen) < 0)
+	{
+		perror("Could not bind");
+		exit(EXIT_FAILURE); //exit if there is an error
+	}
+
+	//after binding we need to set the socket as a listening socket
+	if (listen(cont.sfd, numberofSwitches) < 0)
+	{
+		perror("Could not set socket to listening socket");
+		exit(EXIT_FAILURE); //exit if there is an error
+	}
+
 	char usercmd[30];
 	cout << "Controller Created - supported commands: 'list' and 'exit'" << endl;
 
-	//open up all the FIFOs that are needed (2 * number of switches)
-	for (int i = 0; i < numberofSwitches; i++)
-	{
-		int fdread;
-		int fdwrite;
-		fdread = openFIFO(i + 1, 0);
-		fdwrite = openFIFO(0, i + 1); //zero indexed so we adjust by adding 1 to i
-		cont.fifoReadList.push_back(fdread); 
-		cont.fifoWriteList.push_back(fdwrite);
-	}
+	while (1) //main loop
+	{	
 
-	while (1)
-	{
 		//poll the keyboard for user command
 		struct pollfd keyboardPoll[1]; //initiate and set values
 		keyboardPoll[0].fd = cont.keyboardFifo;
@@ -290,9 +314,9 @@ void executeController(int numberofSwitches)
 			frame = rcvFrame(keyboardPoll[0].fd);
 			strcpy(usercmd, frame.msg.keyboard.usercmd);
 		}
-		
+
 		if (strcmp(usercmd, "list") == 0)
-		{ 
+		{
 			printController(&cont);
 		}
 
@@ -306,54 +330,95 @@ void executeController(int numberofSwitches)
 		//reset usercmd
 		strcpy(usercmd, " ");
 
-		//poll the fifos and see if switches are trying to communicate, first initialize poll fd structure
-		struct pollfd pollReadList[cont.fifoReadList.size()];
+		//poll the socket to see if there are any incoming connections
+		struct pollfd pollSocket[1], pollSwitch[1];
+		pollSocket[0].fd = cont.sfd;
+		pollSocket[0].events = POLLIN;
 
-		for (int i = 0; i < cont.fifoReadList.size(); i++)
-		{	
-			pollReadList[i].fd = cont.fifoReadList.at(i);
-			pollReadList[i].events = POLLIN;
-		}
-
-		poll(pollReadList, cont.fifoReadList.size(), 0); //do not block, only check if data is being shared across FIFOs
-		
-		for (int i = 0; i < cont.fifoReadList.size(); i++)
+		poll(pollSocket, 1, 0); //non blocking poll to check if there is a new connection attempt
+		if ((pollSocket[0].revents&POLLIN) == POLLIN)
 		{
-			if ((pollReadList[i].revents&POLLIN) == POLLIN)
-			{
+			cout << "Attempting to Connect to New Socket..." << endl;
+			//now we may accept the next connection 
+			newsocket = accept(cont.sfd, (struct sockaddr *) &peer_addr, &addr_size);
+			//after accepting the connection we have to wait for the switch details from the
+			//incoming switch
+			pollSwitch[0].fd = newsocket; //fd for incoming socket
+			pollSwitch[0].events = POLLIN;
+
+			poll(pollSwitch, 1, 4); //will timeout after 4 seconds
+			if ((pollSwitch[0].revents&POLLIN) == POLLIN)
+			{	
 				FRAME frame;
-				//if there was a request for communication, then receive frame and check what type of packet was sent
-				frame = rcvFrame(pollReadList[i].fd);
-			
+				frame = rcvFrame(newsocket);
+				cout << "Waiting for Switch Information..." << endl;
 				if (frame.kind == OPEN)
 				{	
 					cont.openRcvCounter += 1;
 					//send the switch ACK and increase ACK counter
-					cout << "New switch attempting to open" << endl;
-					
+					cout << "Switch Information Received" << endl;
+
 					//update controller list and counter
 					cont.connectedSwitches.push_back(frame.msg.packet);
-					sendAckPacket(frame.msg.packet.switchNumber, cont.fifoWriteList[i]); //the corresponding write FIFO is at the same index as the read FIFO
+					sendAckPacket(frame.msg.packet.switchNumber, newsocket); //write ACK frame to socket
 					cont.ackSentCounter += 1;
 				}
 
-				else if (frame.kind == QUERY)
+				else
 				{
-					MSG msg;
-					//create new rule based off dstIP and port numbers
-					msg = createRule(frame.msg.query.port1, frame.msg.query.port2, frame.msg.query.dstIP, frame.msg.query.srcIP,cont);
-
-					//send rule to switch and increase counters
-					cout << "Sending new rule to switch..." << endl;
-					sendAddPacket(frame.msg.query.switchNumber, cont.fifoWriteList[i], &msg);
-					cont.addSentCounter += 1;
-					cont.queryRcvCounter += 1;
+					//if a packet that was sent was not the OPEN type then there is an error
+					cout << "Error: Unexpected Packet Type While Waiting for OPEN" << endl;
 				}
 			}
 		}
-	}	
-	
-	
+
+		//after accepting connection (if any), we poll for any query packets from all the connected switches
+		if (cont.connectedSwitches.size() == 0) { continue; }
+		struct pollfd pollQuery[cont.connectedSwitches.size()];
+		for (int i = 0; i < cont.connectedSwitches.size(); i++)
+		{
+			pollQuery[i].fd = cont.connectedSwitches.at(i).sfd;
+			pollQuery[i].events = POLLIN | POLLHUP;
+		}
+
+		poll(pollQuery, cont.connectedSwitches.size(), 0); //non blocking poll
+		
+		for (int i = 0; i < cont.connectedSwitches.size(); i++)
+		{
+			//check for each socket whether there is a packet to be read or if the client disconnected
+			if ((pollQuery[i].revents&POLLIN) == POLLIN)
+			{
+				//read the packet, it should be a query packet
+				FRAME frame;
+				frame = rcvFrame(pollQuery[i].fd);
+
+				if (frame.kind == QUERY)
+				{
+					MSG msg;
+					//create new rule based off dstIP and port numbers
+					msg = createRule(frame.msg.query.port1, frame.msg.query.port2, frame.msg.query.dstIP, frame.msg.query.srcIP, cont);
+
+					//send rule to switch and increase counters
+					cout << "Sending new rule to switch..." << endl;
+					sendAddPacket(frame.msg.query.switchNumber, pollQuery[i].fd, &msg);
+					cont.addSentCounter += 1;
+					cont.queryRcvCounter += 1;
+				}
+				else {
+					cout << "Error: Unexpected Packet Type While Waiting for QUERY" << endl;
+				}
+				
+			}
+
+			else if ((pollQuery[i].revents&POLLHUP) == POLLHUP)
+			{
+				//client disconnected, notify the user TODO
+				printf("Lost Connection to sw%d\n", cont.connectedSwitches.at(i).switchNumber);
+				cont.connectedSwitches.erase(cont.connectedSwitches.begin() + i); //erase the element from the list of connected switches
+			}
+		}
+	}
+
 }
 
 Rule initializeRules(int lowIP, int highIP)
@@ -401,6 +466,7 @@ MSG composeOpenMessage(Switch* sw)
 	msg.packet.packIP_lo = sw->IP_lo;
 	msg.packet.packIP_hi = sw->IP_hi;
 	msg.packet.switchNumber = sw->switchNumber;
+	msg.packet.sfd = sw->sfd;
 
 	return msg;
 }
@@ -685,6 +751,14 @@ void getUserCmdSwitch(Switch* sw, int pid)
 
 }
 
+void delaySwitch(int interval, Switch* sw)
+{	/*This function is used when a delay command is read from the trafficFile
+	It will delay the switch by the interval amount and still allow polling of neighbouring switches
+	and the keyboard*/
+	printf("DelaySwitch Reached");
+	return;
+}
+
 void executeSwitch(char* filename, int port1, int port2 , int lowIP, int highIP, char* thisSwitch, int switchNum)
 {	/* This method will be used for the instance that the switch is chosen*/
 	//First initialize the switch object
@@ -772,16 +846,26 @@ void executeSwitch(char* filename, int port1, int port2 , int lowIP, int highIP,
 			*/
 				char cline[100];
 				char* temp;
+
+				
+	
 			
 				int ruleExist;
 
 				strcpy(cline, line.c_str());
 		
 				temp = strtok(cline, " "); //temp is now switch name
-				temp = strtok(NULL, " "); //temp is now srcIP
+				temp = strtok(NULL, " "); //temp is now srcIP or 'Delay', if it is delay, we need to delay the switch
+				if (temp == "delay") {
+					delaySwitch(atoi(strtok(NULL, "\t")), &sw); //grab interval and switch
+					continue;
+				}
 				srcIP = atoi(temp);
-				temp = strtok(NULL, " "); //temp is now dstIP
+				temp = strtok(NULL, " "); //temp is now dstIP or time interval in milliseconds to delay
 				dstIP = atoi(temp);
+
+				//first determine if we are going to delay a switch
+			
 
 				ruleExist = checkRuleExists(&sw, dstIP); //checkRuleExists returns index of rule if it exists, otherwise it returns -1
 				//check if there is a rule that exists with these IP ranges
@@ -845,11 +929,11 @@ int main(int argc, char* argv[])
 	char chosenSwitch[100]; //will be used to determine if command line argument was for a switch and not controller
 	strcpy(chosenSwitch, argv[1]);
 	
-	if (strcmp(argv[1], "cont") == 0 && argc == 3) //compare if argument entered was cont 
+	if (strcmp(argv[1], "cont") == 0 && argc == 4) //compare if argument entered was cont 
 	{
 		if (atoi(argv[2]) < 1 || atoi(argv[2]) > 7) { printf("Invalid number of switches\n"); return 0; }
 		controllerSelected = true;
-		executeController(atoi(argv[2]));
+		executeController(atoi(argv[2]), argv[3]);
 
 	}
 
