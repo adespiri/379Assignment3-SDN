@@ -18,6 +18,7 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <netdb.h>
+#include <time.h> //used for delaying switch
 
 #define MAX_NSW 7;
 #define MAX_IP 1000;
@@ -181,12 +182,12 @@ void sendAckPacket(int switchNumber, int sfd)
 	write(sfd, (char *)&frame, sizeof(frame));
 }
 
-void sendAddPacket(int switchNumber, int SCfifo, MSG* msg)
+void sendAddPacket(int switchNumber, int sfd, MSG* msg)
 {	/*this method is used by the controler to send the add packet to the designated switch*/
 	FRAME frame;
 	frame.kind = ADD;
 	frame.msg = *msg;
-	write(SCfifo, (char *)&frame, sizeof(frame));
+	write(sfd, (char *)&frame, sizeof(frame));
 
 }
 //HAVE TO CHANGE THIS
@@ -273,7 +274,7 @@ void executeController(int numberofSwitches, const char* portNum)
 		pollKeyboard(cont.keyboardFifo, CONT_INPUT);
 	}
 
-	
+	sleep(1);
 	int newsocket;
 	struct sockaddr_storage peer_addr;
 	socklen_t addr_size;
@@ -348,21 +349,22 @@ void executeController(int numberofSwitches, const char* portNum)
 			newsocket = accept(cont.sfd, (struct sockaddr *) &peer_addr, &addr_size);
 			//after accepting the connection we have to wait for the switch details from the
 			//incoming switch
+			cout << "New socket: " << newsocket << endl;
 			pollSwitch[0].fd = newsocket; //fd for incoming socket
 			pollSwitch[0].events = POLLIN;
 
+			cout << "Waiting for Switch Information..." << endl;
 			poll(pollSwitch, 1, 3000); //will timeout after 3 seconds
 			if ((pollSwitch[0].revents&POLLIN) == POLLIN)
 			{	
 				FRAME frame;
 				frame = rcvFrame(newsocket);
-				cout << "Waiting for Switch Information..." << endl;
 				if (frame.kind == OPEN)
 				{	
 					cont.openRcvCounter += 1;
 					//send the switch ACK and increase ACK counter
 					cout << "Switch Information Received" << endl;
-
+					frame.msg.packet.sfd = newsocket;
 					//update controller list and counter
 					cont.connectedSwitches.push_back(frame.msg.packet);
 					sendAckPacket(frame.msg.packet.switchNumber, newsocket); //write ACK frame to socket
@@ -379,10 +381,11 @@ void executeController(int numberofSwitches, const char* portNum)
 
 		//after accepting connection (if any), we poll for any query packets from all the connected switches
 		if (cont.connectedSwitches.size() == 0) { continue; }
-		struct pollfd pollQuery[cont.connectedSwitches.size()];
+		struct pollfd pollQuery[(int) cont.connectedSwitches.size()];
 		for (int i = 0; i < cont.connectedSwitches.size(); i++)
 		{
 			pollQuery[i].fd = cont.connectedSwitches.at(i).sfd;
+
 			pollQuery[i].events = POLLIN;
 		}
 
@@ -519,7 +522,7 @@ bool sendOpenPacket(Switch* sw)
 	poll(poll_list, 1, 2000); //wait for two seconds
 	if ((poll_list[0].revents&POLLIN) == POLLIN)
 	{
-		//server wrote to SCfifo
+		//server wrote to server
 		frame = rcvFrame(sw->sfd);
 		if (frame.kind == ACK)
 		{	//switch is now opened and connected to controller, increment counters
@@ -540,25 +543,25 @@ bool sendOpenPacket(Switch* sw)
 
 }
 
-void sendQueryPacket(int CSfifo, int SCfifo, Switch* sw, int dstIP, int srcIP, int switchNumber)
+void sendQueryPacket(Switch* sw, int dstIP, int srcIP, int switchNumber)
 { /*this method is called when a switch cannot find a rule for a line in trafficFile, it sends the open packet
   to the controller and waits to receive the ADD packet*/
 	struct pollfd poll_list[1];
 	MSG msg;
 	FRAME frame;
 
-	poll_list[0].fd = SCfifo;
+	poll_list[0].fd = sw->sfd;
 	poll_list[0].events = POLLIN;
 
 	msg = composeQueryMessage(sw, dstIP, srcIP, switchNumber);
 	//send the frame, indicating it is a packet of type QUERY
-	sendFrame(CSfifo, QUERY, &msg);
+	sendFrame(sw->sfd, QUERY, &msg);
 	printf("Waiting for server to provide rule...\n");
 	poll(poll_list, 1, 2000); //wait for two seconds 
 	if ((poll_list[0].revents&POLLIN) == POLLIN)
 	{
-		//server wrote to SCfifo
-		frame = rcvFrame(SCfifo);
+		//server wrote to socket
+		frame = rcvFrame(sw->sfd);
 		if (frame.kind == ADD)
 		{	//switch received the new rule, now must apply it
 			Rule rule;
@@ -654,7 +657,7 @@ int checkRuleExists(Switch* sw, int dstIP)
 	return -1; //-1 indicates rules does not exist
 }
 
-void pollSwitches(Switch* sw, int p1readFifo, int p1writeFifo, int p2readFifo, int p2writeFifo, int SCfifo, int CSfifo)
+void pollSwitches(Switch* sw, int p1readFifo, int p1writeFifo, int p2readFifo, int p2writeFifo)
 {	/*This function is called at the end of each switch loop. It polls the ports attached to switches
 	and processes any incoming packets*/
 	//poll port1 and port2
@@ -692,7 +695,7 @@ void pollSwitches(Switch* sw, int p1readFifo, int p1writeFifo, int p2readFifo, i
 			{
 				cout << "No rule exists in flow table" << endl;
 				//send query packet to server
-				sendQueryPacket(CSfifo, SCfifo, sw, receivedDstIP, receivedSrcIP, sw->switchNumber);
+				sendQueryPacket(sw, receivedDstIP, receivedSrcIP, sw->switchNumber);
 			}
 
 			//process the packets
@@ -715,7 +718,7 @@ void pollSwitches(Switch* sw, int p1readFifo, int p1writeFifo, int p2readFifo, i
 			{
 				cout << "No rule exists in flow table" << endl;
 				//send query packet to server
-				sendQueryPacket(CSfifo, SCfifo, sw, receivedDstIP, receivedSrcIP, sw->switchNumber);
+				sendQueryPacket(sw, receivedDstIP, receivedSrcIP, sw->switchNumber);
 			}
 
 			//process the packets
@@ -754,7 +757,7 @@ void getUserCmdSwitch(Switch* sw, int pid)
 		close(sw->sfd);		//close the socket
 		kill(pid, SIGKILL); //kill child process when we are done
 		exit(1);
-		return;
+		return; 
 	}
 
 	
@@ -765,7 +768,31 @@ void delaySwitch(int interval, Switch* sw)
 {	/*This function is used when a delay command is read from the trafficFile
 	It will delay the switch by the interval amount and still allow polling of neighbouring switches
 	and the keyboard*/
-	printf("DelaySwitch Reached");
+	printf("Entering a delay period of %d milliseconds\n", interval);
+	long long int nanoseconds; //going to be using nanosleep 
+	pid_t newpid;
+
+	nanoseconds = interval * 1000000; //convert form milliseconds to nanoseconds
+
+	//fork a child that will monitor the keyboard during the duration of the delay period
+	newpid = fork();
+	if (newpid == 0) 
+	{
+		while (1)
+		{
+			struct pollfd keyboard[1];
+			keyboard[0].fd = STDIN_FILENO;
+			keyboard[0].events = POLLIN;
+
+			poll(keyboard, 1, 0); //poll the keyboard
+			if ((keyboard[0].revents&POLLIN) == POLLIN)
+			{
+
+			}
+		}
+	}
+
+
 	return;
 }
 
@@ -781,8 +808,6 @@ void executeSwitch(char* filename, int port1, int port2 , int lowIP, int highIP,
 
 	Switch sw;
 	instanceSwitch = &sw; //global switch equals sw, FOR USER1SIGNAL handling
-	int CSfifo;
-	int SCfifo;
 	int p1writeFifo;
 	int p1readFifo;
 	int p2writeFifo;
@@ -832,10 +857,6 @@ void executeSwitch(char* filename, int port1, int port2 , int lowIP, int highIP,
 	printf("Switch number %d opened. Type in list or exit command to see switch info\n", switchNum);
 	//initialize the first rule 
 	sw.rulesList.push_back(initializeRules(lowIP, highIP));
-
-	//open up the FIFOs for this switch/controller pair as well as switch/switch pairs
-	CSfifo = openFIFO(sw.switchNumber, 0);
-	SCfifo = openFIFO(0, sw.switchNumber);
 	
 	if (sw.port1 != -1) //-1 indicates null and no connected switch to port 1
 	{
@@ -879,12 +900,13 @@ void executeSwitch(char* filename, int port1, int port2 , int lowIP, int highIP,
 		
 				temp = strtok(cline, " "); //temp is now switch name
 				temp = strtok(NULL, " "); //temp is now srcIP or 'Delay', if it is delay, we need to delay the switch
-				if (temp == "delay") {
-					delaySwitch(atoi(strtok(NULL, "\t")), &sw); //grab interval and switch
+				if (strcmp("delay", temp) == 0) {
+	
+					delaySwitch(atoi(strtok(NULL, " ")), &sw); //grab interval and switch
 					continue;
 				}
 				srcIP = atoi(temp);
-				temp = strtok(NULL, " "); //temp is now dstIP or time interval in milliseconds to delay
+				temp = strtok(NULL, " "); //temp is now dstIP 
 				dstIP = atoi(temp);
 
 				//first determine if we are going to delay a switch
@@ -896,7 +918,7 @@ void executeSwitch(char* filename, int port1, int port2 , int lowIP, int highIP,
 				{
 					cout << "No rule exists in flow table" << endl;
 					//send query packet to server
-					sendQueryPacket(CSfifo, SCfifo, &sw, dstIP, srcIP, sw.switchNumber);
+					sendQueryPacket(&sw, dstIP, srcIP, sw.switchNumber);
 				}
 
 				//relay packet
@@ -907,7 +929,7 @@ void executeSwitch(char* filename, int port1, int port2 , int lowIP, int highIP,
 				
 				
 				//poll ports 1 and ports 2
-				pollSwitches(&sw, p1readFifo, p1writeFifo, p2readFifo, p2writeFifo, SCfifo, CSfifo);
+				pollSwitches(&sw, p1readFifo, p1writeFifo, p2readFifo, p2writeFifo);
 			}
 			file.close();
 		}
@@ -915,7 +937,7 @@ void executeSwitch(char* filename, int port1, int port2 , int lowIP, int highIP,
 		//once file is done being read we still wait for keystrokes and poll 
 		getUserCmdSwitch(&sw, newpid);
 		//poll port1 and port2
-		pollSwitches(&sw, p1readFifo, p1writeFifo, p2readFifo, p2writeFifo, SCfifo, CSfifo);
+		pollSwitches(&sw, p1readFifo, p1writeFifo, p2readFifo, p2writeFifo);
 	}
 	
 }
