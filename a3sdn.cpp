@@ -26,8 +26,9 @@
 
 using namespace std;
 
-typedef enum {ACK, OPEN, QUERY, ADD, RELAY, CONT_INPUT, SWITCH_INPUT} KIND; //7 different kinds of PACKETS. CONT_INPUT AND SWITCH_INPUT ARE USED FOR POLLING KEYBOARD
-typedef enum {DROP, FORWARD } ACTION; //two different kinds of actions
+typedef enum {ACK, OPEN, QUERY, ADD, RELAY, CONT_INPUT, SWITCH_INPUT, TERMINATED_SWITCH} KIND; //8 different kinds of PACKETS. CONT_INPUT AND SWITCH_INPUT ARE USED FOR POLLING KEYBOARD
+																								//TERMINATED_SWITCH is used to notify the controller of terminated switches
+typedef enum {DROP, FORWARD } ACTION; //two different kinds of actions					
 
 typedef struct {
 	int srcIP_lo;
@@ -148,6 +149,10 @@ FRAME rcvFrame(int fd)
 	assert(fd >= 0);
 	memset((char *)&frame, 0, sizeof(frame));
 	len = read(fd, (char *)&frame, sizeof(frame));
+	if (len == 0) {
+		//len is 0 when the client unexpectedly terminates
+		frame.kind = TERMINATED_SWITCH;
+	}
 	
 	return frame;
 }
@@ -346,7 +351,7 @@ void executeController(int numberofSwitches, const char* portNum)
 			pollSwitch[0].fd = newsocket; //fd for incoming socket
 			pollSwitch[0].events = POLLIN;
 
-			poll(pollSwitch, 1, 4); //will timeout after 4 seconds
+			poll(pollSwitch, 1, 3000); //will timeout after 3 seconds
 			if ((pollSwitch[0].revents&POLLIN) == POLLIN)
 			{	
 				FRAME frame;
@@ -378,19 +383,28 @@ void executeController(int numberofSwitches, const char* portNum)
 		for (int i = 0; i < cont.connectedSwitches.size(); i++)
 		{
 			pollQuery[i].fd = cont.connectedSwitches.at(i).sfd;
-			pollQuery[i].events = POLLIN | POLLHUP;
+			pollQuery[i].events = POLLIN;
 		}
 
 		poll(pollQuery, cont.connectedSwitches.size(), 0); //non blocking poll
 		
 		for (int i = 0; i < cont.connectedSwitches.size(); i++)
-		{
+		{	
+			 
 			//check for each socket whether there is a packet to be read or if the client disconnected
 			if ((pollQuery[i].revents&POLLIN) == POLLIN)
 			{
 				//read the packet, it should be a query packet
 				FRAME frame;
 				frame = rcvFrame(pollQuery[i].fd);
+				if (frame.kind == TERMINATED_SWITCH)
+				{	//if the frame is 0 that means the client disconnected
+					printf("Lost Connection to sw%d\n", cont.connectedSwitches.at(i).switchNumber);
+					close(cont.connectedSwitches.at(i).sfd);
+					cont.connectedSwitches.erase(cont.connectedSwitches.begin() + i); //erase the element from the list of connected switches
+					continue;
+
+				}
 
 				if (frame.kind == QUERY)
 				{
@@ -410,12 +424,7 @@ void executeController(int numberofSwitches, const char* portNum)
 				
 			}
 
-			else if ((pollQuery[i].revents&POLLHUP) == POLLHUP)
-			{
-				//client disconnected, notify the user TODO
-				printf("Lost Connection to sw%d\n", cont.connectedSwitches.at(i).switchNumber);
-				cont.connectedSwitches.erase(cont.connectedSwitches.begin() + i); //erase the element from the list of connected switches
-			}
+			
 		}
 	}
 
@@ -492,26 +501,26 @@ MSG composeRelayMessage(int dstIP, int srcIP)
 	return msg;
 }
 
-bool sendOpenPacket(int CSfifo, int SCfifo, Switch* sw)
+bool sendOpenPacket(Switch* sw)
 { /*this method is called when a switch is initialized, it sends the open packet
   to the controller and waits to receive the ACK packet. Returns true if successful*/
-	struct pollfd poll_list[1]; //help on using poll from http://www.unixguide.net/unix/programming/2.1.2.shtml
+	struct pollfd poll_list[1]; 
 	MSG msg;
 	FRAME frame;
 
-	poll_list[0].fd = SCfifo;
+	poll_list[0].fd = sw->sfd;
 	poll_list[0].events = POLLIN;
 
 	msg = composeOpenMessage(sw);
 	//send the frame, indicating it is a packet of type OPEN
-	sendFrame(CSfifo, OPEN, &msg);
+	sendFrame(sw->sfd, OPEN, &msg);
 	//use polling and wait for server to send ACK packet
 	printf("Waiting for server to acknowledge...\n");
 	poll(poll_list, 1, 2000); //wait for two seconds
 	if ((poll_list[0].revents&POLLIN) == POLLIN)
 	{
 		//server wrote to SCfifo
-		frame = rcvFrame(SCfifo);
+		frame = rcvFrame(sw->sfd);
 		if (frame.kind == ACK)
 		{	//switch is now opened and connected to controller, increment counters
 			sw->openCounter += 1;
@@ -742,6 +751,7 @@ void getUserCmdSwitch(Switch* sw, int pid)
 	else if (strcmp(usercmd, "exit") == 0)
 	{	//print out list and exit
 		printFlowTable(sw);
+		close(sw->sfd);		//close the socket
 		kill(pid, SIGKILL); //kill child process when we are done
 		exit(1);
 		return;
@@ -759,7 +769,7 @@ void delaySwitch(int interval, Switch* sw)
 	return;
 }
 
-void executeSwitch(char* filename, int port1, int port2 , int lowIP, int highIP, char* thisSwitch, int switchNum)
+void executeSwitch(char* filename, int port1, int port2 , int lowIP, int highIP, char* thisSwitch, int switchNum, const char* servAddress, const char* portNum)
 {	/* This method will be used for the instance that the switch is chosen*/
 	//First initialize the switch object
 	string line; //initiate trafficfile
@@ -769,8 +779,6 @@ void executeSwitch(char* filename, int port1, int port2 , int lowIP, int highIP,
 		printf("TRAFFICFILE DOES NOT EXIST\n"); exit(1);
 	} //check if file exists
 
-
-	printf("Switch number %d opened. Type in list or exit command to see switch info\n", switchNum);
 	Switch sw;
 	instanceSwitch = &sw; //global switch equals sw, FOR USER1SIGNAL handling
 	int CSfifo;
@@ -781,6 +789,7 @@ void executeSwitch(char* filename, int port1, int port2 , int lowIP, int highIP,
 	int p2readFifo;
 	int dstIP;
 	int srcIP;
+	struct addrinfo hints, *res;
 
 	sw.opened = false;
 	sw.port1 = port1;
@@ -805,8 +814,22 @@ void executeSwitch(char* filename, int port1, int port2 , int lowIP, int highIP,
 
 	pid_t newpid = fork(); //fork, child will go to polling state
 	if (newpid == 0) { pollKeyboard(sw.keyboardFifo, SWITCH_INPUT); }
+
+	//utilize getaddrinfo to specify what server we are connecting to
+	memset(&hints, 0, sizeof(hints));
+	hints.ai_family = AF_INET;
+	hints.ai_socktype = SOCK_STREAM;
 	
-	
+	getaddrinfo(servAddress, portNum, &hints, &res);
+
+	//create the socket and connect
+	sw.sfd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+	if (connect(sw.sfd, res->ai_addr, res->ai_addrlen) < 0)
+	{
+		perror("Switch Could Not Connect to Server");
+		exit(EXIT_FAILURE);
+	}
+	printf("Switch number %d opened. Type in list or exit command to see switch info\n", switchNum);
 	//initialize the first rule 
 	sw.rulesList.push_back(initializeRules(lowIP, highIP));
 
@@ -827,7 +850,7 @@ void executeSwitch(char* filename, int port1, int port2 , int lowIP, int highIP,
 	}
 
 	//send open packet to controller, if not successful, kill child process,return
-	if (!sendOpenPacket(CSfifo, SCfifo, &sw)) { kill(newpid, SIGKILL); return; }
+	if (!sendOpenPacket(&sw)) { kill(newpid, SIGKILL); return; }
 
 	while (1) 
 	{
@@ -937,7 +960,7 @@ int main(int argc, char* argv[])
 
 	}
 
-	else if (chosenSwitch[0] == 's' && chosenSwitch[1] == 'w' && argc == 6 ) //compare if argument was switch
+	else if (chosenSwitch[0] == 's' && chosenSwitch[1] == 'w' && argc == 8 ) //compare if argument was switch
 	{
 		if (strlen(chosenSwitch) != 3) 
 		{
@@ -986,7 +1009,7 @@ int main(int argc, char* argv[])
 			port2num = atoi(&port2[2]);
 		}
 
-		executeSwitch(filename, port1num, port2num, lowIP, highIP, chosenSwitch, atoi(&chosenSwitch[2]));
+		executeSwitch(filename, port1num, port2num, lowIP, highIP, chosenSwitch, atoi(&chosenSwitch[2]), argv[6], argv[7]);
 
 	}
 
