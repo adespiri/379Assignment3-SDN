@@ -283,7 +283,7 @@ void executeController(int numberofSwitches, const char* portNum)
 		{
 			fgets(usercmd, 20, stdin);
 			strtok(usercmd, "\n");
-			cout << "Reached" << endl;
+
 		}
 
 		if (strcmp(usercmd, "list") == 0)
@@ -308,12 +308,12 @@ void executeController(int numberofSwitches, const char* portNum)
 		poll(pollSocket, 1, 0); //non blocking poll to check if there is a new connection attempt
 		if ((pollSocket[0].revents&POLLIN) == POLLIN)
 		{
-			cout << "Attempting to Connect to New Socket..." << endl;
+
 			//now we may accept the next connection 
 			newsocket = accept(cont.sfd, (struct sockaddr *) &peer_addr, &addr_size);
 			//after accepting the connection we have to wait for the switch details from the
 			//incoming switch
-			cout << "New socket: " << newsocket << endl;
+
 			pollSwitch[0].fd = newsocket; //fd for incoming socket
 			pollSwitch[0].events = POLLIN;
 
@@ -327,11 +327,15 @@ void executeController(int numberofSwitches, const char* portNum)
 				{	
 					cont.openRcvCounter += 1;
 					//send the switch ACK and increase ACK counter
-					cout << "Switch Information Received" << endl;
+					cout << "\nSwitch Information Received:" << endl;
+					printf("Received (src= sw%d, dest = cont [OPEN]:\n\t(port0= cont, port1 = %d, port2= %d , port3= %d-%d\n",
+						frame.msg.packet.switchNumber, frame.msg.packet.port1, frame.msg.packet.port2, frame.msg.packet.packIP_lo,
+						frame.msg.packet.packIP_hi);
 					frame.msg.packet.sfd = newsocket;
 					//update controller list and counter
 					cont.connectedSwitches.push_back(frame.msg.packet);
 					sendAckPacket(frame.msg.packet.switchNumber, newsocket); //write ACK frame to socket
+					printf("Transmitted (src= cont, dest=%d [ACK]\n\n\n", frame.msg.packet.switchNumber);
 					cont.ackSentCounter += 1;
 				}
 
@@ -374,13 +378,21 @@ void executeController(int numberofSwitches, const char* portNum)
 				}
 
 				if (frame.kind == QUERY)
-				{
+				{	
+					printf("Receiving QUERY from sw%d\n", frame.msg.query.switchNumber);
+					printf("Received (src= sw%d, dest= cont) [QUERY]: header= (srcIP=%d, destIP= %d)\n",
+						frame.msg.query.switchNumber, frame.msg.query.srcIP, frame.msg.query.dstIP);
 					MSG msg;
 					//create new rule based off dstIP and port numbers
 					msg = createRule(frame.msg.query.port1, frame.msg.query.port2, frame.msg.query.dstIP, frame.msg.query.srcIP, cont);
 
 					//send rule to switch and increase counters
-					cout << "Sending new rule to switch..." << endl;
+					char actionString[20];
+					if (msg.rule.actionType == FORWARD) { strcpy(actionString, "FORWARD"); }
+					else if (msg.rule.actionType == DROP) { strcpy(actionString, "DROP"); }
+					printf("Transmitted (src= cont, dest= sw%d) [ADD]:\n\t(srcIP= %d-%d, destIP= %d-%d, action=%s:%d, pri= %d, pktCount= %d\n\n\n",
+						frame.msg.query.switchNumber, msg.rule.srcIP_lo, msg.rule.srcIP_hi, msg.rule.dstIP_lo,
+						msg.rule.dstIP_hi, actionString, msg.rule.actionVal, msg.rule.pri, msg.rule.pktCount);
 					sendAddPacket(frame.msg.query.switchNumber, pollQuery[i].fd, &msg);
 					cont.addSentCounter += 1;
 					cont.queryRcvCounter += 1;
@@ -731,10 +743,21 @@ void delaySwitch(int interval, Switch* sw)
 	It will delay the switch by the interval amount and still allow polling of neighbouring switches
 	and the keyboard*/
 	printf("Entering a delay period of %d milliseconds\n", interval);
-	long long int nanoseconds; //going to be using nanosleep 
+	int nanoseconds = 0; //going to be using nanosleep 
+	int seconds = 0;
 	pid_t newpid;
+	struct timespec req, rem; //nanosleep https://stackoverflow.com/questions/7684359/how-to-use-nanosleep-in-c-what-are-tim-tv-sec-and-tim-tv-nsec
 
-	nanoseconds = interval * 1000000; //convert form milliseconds to nanoseconds
+	while (interval >= 1000) //this loop is used to find how many seconds there are
+	{
+		seconds += 1;
+		interval -= 1000;
+	}
+
+	//now set the remainder as nano seconds
+	nanoseconds = interval * 1000000;
+	req.tv_sec = seconds;
+	req.tv_nsec = nanoseconds;
 
 	//fork a child that will monitor the keyboard during the duration of the delay period
 	newpid = fork();
@@ -743,18 +766,38 @@ void delaySwitch(int interval, Switch* sw)
 		while (1)
 		{
 			struct pollfd keyboard[1];
+			char usercmd[20];
 			keyboard[0].fd = STDIN_FILENO;
 			keyboard[0].events = POLLIN;
 
 			poll(keyboard, 1, 0); //poll the keyboard
 			if ((keyboard[0].revents&POLLIN) == POLLIN)
 			{
-
+				fgets(usercmd, 20, stdin);
+				strtok(usercmd, "\n");
 			}
+			if (strcmp(usercmd, "list") == 0)
+			{	//print out list
+				printFlowTable(sw);
+				return;
+			}
+
+			else if (strcmp(usercmd, "exit") == 0)
+			{	//print out list and exit
+				printFlowTable(sw);
+				close(sw->sfd);		//close the socket
+				exit(1);
+				return;
+			}
+			
 		}
 	}
 
+	//put the process to sleep
+	nanosleep(&req, &rem);
 
+	//after waking up kill the child process and return
+	kill(newpid, SIGKILL);
 	return;
 }
 
