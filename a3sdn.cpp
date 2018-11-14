@@ -390,7 +390,7 @@ void executeController(int numberofSwitches, const char* portNum)
 					char actionString[20];
 					if (msg.rule.actionType == FORWARD) { strcpy(actionString, "FORWARD"); }
 					else if (msg.rule.actionType == DROP) { strcpy(actionString, "DROP"); }
-					printf("Transmitted (src= cont, dest= sw%d) [ADD]:\n\t(srcIP= %d-%d, destIP= %d-%d, action=%s:%d, pri= %d, pktCount= %d\n\n\n",
+					printf("Transmitted (src= cont, dest= sw%d) [ADD]:\n\t(srcIP= %d-%d, destIP= %d-%d, action=%s:%d, pri= %d, pktCount= %d)\n\n\n",
 						frame.msg.query.switchNumber, msg.rule.srcIP_lo, msg.rule.srcIP_hi, msg.rule.dstIP_lo,
 						msg.rule.dstIP_hi, actionString, msg.rule.actionVal, msg.rule.pri, msg.rule.pktCount);
 					sendAddPacket(frame.msg.query.switchNumber, pollQuery[i].fd, &msg);
@@ -495,6 +495,8 @@ bool sendOpenPacket(Switch* sw)
 	sendFrame(sw->sfd, OPEN, &msg);
 	//use polling and wait for server to send ACK packet
 	printf("Waiting for server to acknowledge...\n");
+	printf("\nTransmitted (src= sw%d, dest= cont) [OPEN]:\n\t(port0= cont, port1= %d, port2 = %d, port3, %d-%d)\n\n",
+		sw->switchNumber, sw->port1, sw->port2, sw->IP_lo, sw->IP_hi);
 	poll(poll_list, 1, 2000); //wait for two seconds
 	if ((poll_list[0].revents&POLLIN) == POLLIN)
 	{
@@ -506,6 +508,7 @@ bool sendOpenPacket(Switch* sw)
 			sw->ackCounter += 1;
 			sw->opened = true;
 			printf("Acknowledgement Received... \n");
+			printf("Received (src= cont, dest= sw%d) [ACK]\n\n", sw->switchNumber);
 			return true;
 		}
 
@@ -533,6 +536,8 @@ void sendQueryPacket(Switch* sw, int dstIP, int srcIP, int switchNumber)
 	//send the frame, indicating it is a packet of type QUERY
 	sendFrame(sw->sfd, QUERY, &msg);
 	printf("Waiting for server to provide rule...\n");
+	printf("Transmitted (src= sw%d, dest= cont) [QUERY]: header= (srcIP= %d, destIP= %d)\n\n",
+		sw->switchNumber, srcIP, dstIP);
 	poll(poll_list, 1, 2000); //wait for two seconds 
 	if ((poll_list[0].revents&POLLIN) == POLLIN)
 	{
@@ -552,7 +557,13 @@ void sendQueryPacket(Switch* sw, int dstIP, int srcIP, int switchNumber)
 			sw->rulesList.push_back(rule); 
 			sw->queryCounter += 1;
 			sw->addCounter += 1;
+			char actionString[20];
+			if (rule.actionType == DROP) { strcpy(actionString, "DROP"); }
+			else if (rule.actionType == FORWARD) { strcpy(actionString, "FORWARD"); }
 			printf("Rule Received... \n");
+			printf("Received (src= cont, dest= sw%d) [ADD]:\n\t(srcIP= %d-%d, destIP= %d-%d, action= %s:%d, pri= %d, pktCount= %d\n\n",
+				sw->switchNumber, rule.srcIP_lo, rule.srcIP_hi, rule.dstIP_lo, rule.dstIP_hi, actionString, rule.actionVal,
+				rule.pri, rule.pktCount);
 			return;
 		}
 
@@ -615,6 +626,10 @@ void processPacket(int srcIP, int dstIP, Switch* sw, int p1writeFifo, int p2writ
 		if (sendToPort == 1) { selectedFifo = p1writeFifo; }
 		else if (sendToPort == 2) { selectedFifo = p2writeFifo; }
 
+		printf("Relaying Packet\n");
+		printf("Transmitted (src= sw%d, ToPort= %d) [RELAYOUT]: (srcIP= %d, destIP= %d)\n\n", 
+			sw->switchNumber, sendToPort,srcIP, dstIP);
+
 		sendRelayPacket(srcIP, dstIP, sw, selectedFifo);
 		sw->relayOutCounter += 1; //increment counter
 		sw->rulesList.at(index).pktCount += 1;
@@ -665,6 +680,8 @@ void pollSwitches(Switch* sw, int p1readFifo, int p1writeFifo, int p2readFifo, i
 		{
 			receivedSrcIP = frame.msg.relay.srcIP;
 			receivedDstIP = frame.msg.relay.dstIP;
+			printf("Received (FromPort= 1, dest= sw%d) [RELAYIN]: (srcIP= %d, dstIP= %d)\n\n",
+				sw->switchNumber, receivedSrcIP, receivedDstIP);
 			sw->relayInCounter += 1; //increment counter
 			//check if srcIP and dstIP rule are in current switch
 			if (checkRuleExists(sw, receivedDstIP) == -1) //rule does not exists
@@ -688,6 +705,8 @@ void pollSwitches(Switch* sw, int p1readFifo, int p1writeFifo, int p2readFifo, i
 		{
 			receivedSrcIP = frame.msg.relay.srcIP;
 			receivedDstIP = frame.msg.relay.dstIP;
+			printf("Received (FromPort= 2, dest= sw%d) [RELAYIN]: (srcIP= %d, dstIP= %d)\n\n",
+				sw->switchNumber, receivedSrcIP, receivedDstIP);
 			sw->relayInCounter += 1; //increment counter
 			//check if srcIP and dstIP rule are in current switch
 			if (checkRuleExists(sw, receivedDstIP) == -1) //rule does not exists
