@@ -757,13 +757,14 @@ void getUserCmdSwitch(Switch* sw)
 
 }
 
-void delaySwitch(int interval, Switch* sw)
+void delaySwitch(int interval, Switch* sw, int p1readFifo, int p1writeFifo, int p2readFifo, int p2writeFifo)
 {	/*This function is used when a delay command is read from the trafficFile
 	It will delay the switch by the interval amount and still allow polling of neighbouring switches
 	and the keyboard*/
-	printf("Entering a delay period of %d milliseconds\n", interval);
+	printf("Entering a delay period of %d milliseconds\n\n", interval);
 	int nanoseconds = 0; //going to be using nanosleep 
 	int seconds = 0;
+	int status;
 	pid_t newpid;
 	struct timespec req, rem; //nanosleep https://stackoverflow.com/questions/7684359/how-to-use-nanosleep-in-c-what-are-tim-tv-sec-and-tim-tv-nsec
 
@@ -798,22 +799,32 @@ void delaySwitch(int interval, Switch* sw)
 			if (strcmp(usercmd, "list") == 0)
 			{	//print out list
 				printFlowTable(sw);
-				return;
+				
 			}
 
 			else if (strcmp(usercmd, "exit") == 0)
 			{	//print out list and exit
 				printFlowTable(sw);
+				printf("Exiting...\n");
 				close(sw->sfd);		//close the socket
-				exit(1);
-				return;
-			}
+				kill(getpid(), SIGKILL); //child terminates itself
 			
+			}
+			strcpy(usercmd, " "); //reset user cmd
+			
+			//pollswitches
+			pollSwitches(sw, p1readFifo, p1writeFifo, p2readFifo, p2writeFifo);
 		}
 	}
 
 	//put the process to sleep
 	nanosleep(&req, &rem);
+
+	//check if child terminated itself, if yes then the user wants to exit the main program
+	if (waitpid(newpid, &status, WNOHANG) != 0)
+	{
+		exit(1);
+	}
 
 	//after waking up kill the child process and return
 	kill(newpid, SIGKILL);
@@ -917,7 +928,7 @@ void executeSwitch(char* filename, int port1, int port2 , int lowIP, int highIP,
 				temp = strtok(NULL, " "); //temp is now srcIP or 'Delay', if it is delay, we need to delay the switch
 				if (strcmp("delay", temp) == 0) {
 	
-					delaySwitch(atoi(strtok(NULL, " ")), &sw); //grab interval and switch
+					delaySwitch(atoi(strtok(NULL, " ")), &sw, p1readFifo, p1writeFifo, p2readFifo, p2writeFifo);
 					continue;
 				}
 				srcIP = atoi(temp);
